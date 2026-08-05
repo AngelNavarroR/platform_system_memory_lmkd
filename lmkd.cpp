@@ -38,9 +38,11 @@
 #include <array>
 #include <memory>
 #include <shared_mutex>
+#include <string>
 #include <vector>
 
 #include <BpfSyscallWrappers.h>
+#include <android-base/properties.h>
 #include <android-base/stringify.h>
 #include <android-base/unique_fd.h>
 #include <bpf/WaitForProgsLoaded.h>
@@ -201,6 +203,55 @@ static int64_t upgrade_pressure;
 static int64_t downgrade_pressure;
 static bool low_ram_device;
 static bool kill_heaviest_task;
+
+/*
+ * Blossom: paquetes que lmkd NO debe matar salvo que no quede otra (4 ago 2026).
+ *
+ * POR QUE: lmkd es el unico eslabon que mataba sin consultar a nadie. AMS respeta la
+ * lista de BlossomRamPolicy y memgov la suya, pero lmkd va por libre: el 4 ago se
+ * llevo 'com.google.android.gms:persistent' en oom_score_adj 800 -- por DEBAJO de la
+ * banda cacheada -- con "low watermark is breached". El reparto 900/999 de la Fase C
+ * no lo frena porque lmkd baja de 900 cuando se rompe la marca de agua.
+ *
+ * COMO: la lista llega por PROPIEDAD, no leyendo /data/system/ramprotect.conf. Un
+ * fichero exigiria darle a lmkd acceso SELinux a system_data_file, y no vale la pena
+ * el riesgo: el guard 25-lmkd-tune.sh ya hace resetprop + lmkd.reinit en cada arranque,
+ * asi que puede publicar ahi la lista derivada del mismo ramprotect.conf.
+ *   ro.lmk.protect_names = subcadenas separadas por comas (se compara con strstr,
+ *                          igual que hacen memgov y memguard)
+ *   ro.lmk.protect_floor = por debajo de este min_score_adj la proteccion NO aplica
+ *                          (default 0: si lmkd ya esta dispuesto a matar foreground,
+ *                          es que no hay nada mejor y proteger seria peor)
+ */
+static std::vector<std::string> protect_names;
+static int protect_floor;
+
+static bool is_blossom_protected(const char* taskname, int min_oom_score) {
+    if (protect_names.empty() || !taskname) return false;
+    /* Situacion desesperada: dejar que mate lo que haga falta antes que quedarnos
+     * sin candidatos y que actue el OOM killer del kernel, que es mucho peor. */
+    if (min_oom_score <= protect_floor) return false;
+    for (const auto& n : protect_names) {
+        if (strstr(taskname, n.c_str())) return true;
+    }
+    return false;
+}
+
+static void parse_protect_names(const std::string& csv) {
+    protect_names.clear();
+    size_t ini = 0;
+    while (ini <= csv.size()) {
+        size_t fin = csv.find(',', ini);
+        if (fin == std::string::npos) fin = csv.size();
+        std::string t = csv.substr(ini, fin - ini);
+        /* recortar espacios: la lista la genera un script de shell */
+        size_t a = t.find_first_not_of(" \t");
+        size_t b = t.find_last_not_of(" \t");
+        if (a != std::string::npos) protect_names.push_back(t.substr(a, b - a + 1));
+        if (fin == csv.size()) break;
+        ini = fin + 1;
+    }
+}
 static unsigned long kill_timeout_ms;
 static int pressure_after_kill_min_score;
 static bool use_minfree_levels;
@@ -2482,6 +2533,18 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
         goto out;
     }
 
+    /*
+     * Blossom: intocable -> no lo matamos. Se sale por 'out', que hace pid_remove():
+     * eso lo saca de la lista de esta ronda y el bucle de find_and_kill_process pasa
+     * al siguiente candidato del mismo adj. Sin el pid_remove, proc_get_heaviest()
+     * devolveria el MISMO proceso una y otra vez -> bucle infinito.
+     */
+    if (is_blossom_protected(taskname, min_oom_score)) {
+        ALOGI("Blossom: NO mato '%s' (%d, adj %d): protegido [min_score_adj=%d]",
+              taskname, pid, procp->oomadj, min_oom_score);
+        goto out;
+    }
+
     mem_st = stats_read_memory_stat(per_app_memcg, pid, uid, rss_kb * 1024, swap_kb * 1024);
 
     snprintf(desc, sizeof(desc), "lmk,%d,%d,%d,%d,%d", pid, ki ? (int)ki->kill_reason : -1,
@@ -4165,6 +4228,13 @@ static bool update_props() {
         (int64_t)GET_LMK_PROPERTY(int32, "downgrade_pressure", 100);
     kill_heaviest_task =
         GET_LMK_PROPERTY(bool, "kill_heaviest_task", false);
+    /* Blossom: lista de intocables + suelo de desesperacion (ver is_blossom_protected) */
+    parse_protect_names(android::base::GetProperty("ro.lmk.protect_names", ""));
+    protect_floor = GET_LMK_PROPERTY(int32, "protect_floor", 0);
+    if (!protect_names.empty()) {
+        ALOGI("Blossom: %zu paquetes protegidos de lmkd (suelo min_score_adj=%d)",
+              protect_names.size(), protect_floor);
+    }
     low_ram_device = property_get_bool("ro.config.low_ram", false);
     kill_timeout_ms =
         (unsigned long)GET_LMK_PROPERTY(int32, "kill_timeout_ms", 100);
