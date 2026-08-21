@@ -3060,6 +3060,16 @@ update_watermarks:
         kill_reason = NOT_RESPONDING;
         strncpy(kill_desc, "device is not responding", sizeof(kill_desc));
         kill_desc[sizeof(kill_desc) - 1] = '\0';
+        /* blossom: no matar lo que el usuario esta mirando salvo desesperacion real.
+         * Las 5 ramas hermanas de este if-else ya llevan esta misma guarda; esta era
+         * la UNICA sin ella, asi que min_score_adj se quedaba en 0 (linea 2828) y lmkd
+         * elegia al proceso mas gordo sin mirar si estaba en primer plano. En blossom
+         * el mas gordo es siempre la banca (465 MB), y moria estando en TOP con
+         * adj 102 y sin estado guardado. Con wmark <= WMARK_MIN o thrashing critico
+         * se sigue permitiendo, para no dejar el trabajo al OOM killer del kernel. */
+        if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
+            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        }
     } else if (swap_is_low && thrashing > thrashing_limit_pct) {
         /* Page cache is thrashing while swap is low */
         kill_reason = LOW_SWAP_AND_THRASHING;
